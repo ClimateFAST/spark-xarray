@@ -6,6 +6,6 @@ from __future__ import absolute_import
 __all__ = []
 
 # Package version number.
-__version__ = version = '0.1.dev0'
+__version__ = version = '0.2.dev0'
 
 

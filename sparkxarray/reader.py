@@ -26,7 +26,6 @@ import itertools
 from glob import glob
 from pyspark.sql import SparkSession
 
-
 def ncread(sc, paths, mode='single', **kwargs):
     """Calls sparkxarray netcdf read function based on the mode parameter.
 
@@ -50,6 +49,7 @@ def ncread(sc, paths, mode='single', **kwargs):
     mode     : str
                'single' for a single file
                'multi' for multiple files
+               'hdfs' for reading multiple files as binary from HDFS, then using them as in-memory NetCDF files, and then partitioning with groupBy
 
     **kwargs : dict
                partitioning options to be passed on to the actual read function.
@@ -70,6 +70,8 @@ def ncread(sc, paths, mode='single', **kwargs):
 
     elif (mode == 'multi'):
         return read_nc_multi(sc, paths, **kwargs)
+    elif (mode == 'hdfs'):
+        return read_nc_hdfs(sc, paths, **kwargs)
     else:
         raise NotImplementedError(error_msg)
 
@@ -193,3 +195,60 @@ def read_nc_multi(sc, paths, **kwargs):
 
     return rdd
 
+def read_nc_hdfs(sc, paths, **kwargs):
+    """ Read one or more netCDF files from DHFS
+
+    Parameters
+    -----------
+    sc       :  sparkContext object
+
+    paths    :  str or sequence
+                Either a string glob in the form "path/to/my/files/*.nc" or an explicit
+                list of files to open
+
+    **kwargs : dict
+               Additional arguments for partitioning 
+
+    """
+    partition_on = kwargs.get('partition_on')
+    partitions = kwargs.get('partitions')
+    merge = kwargs.get('merge')
+
+    print("Running spark-xarray in HDFS mode")
+
+    binrdd = sc.binaryFiles(paths)
+
+    def nc_load(data):
+        name,nc_bytes = data
+        dset = xr.open_dataset(nc_bytes)
+        return dset
+
+    datardd = binrdd.map(nc_load)
+    if not partition_on:
+        return datardd
+
+    def dict_to_key(x):
+        if len(x) == 1:
+            return next (iter (x.values()))
+        else:
+            return tuple(x.values())
+
+
+    def nc_partition(dset):       
+        # D = {'dim_1': dim_1_size, 'dim_2': dim_2_size, ...}
+        D ={dset[dimension].name:dset[dimension].size for dimension in partition_on}       
+        # dim_sizes = [range(dim_1_size), range(dim_2_size), range(...)]
+        dim_ranges = [range(dim_size) for dim_size in D.values()]
+        dim_cartesian_product_indices = [element for element in itertools.product(*dim_ranges)]
+        # create a list of dictionaries for  positional indexing
+        positional_indices = [dict(zip(partition_on, ij)) for ij in dim_cartesian_product_indices]
+        return map(lambda x: (dict_to_key(x), readone_slice(dset, x).load()), positional_indices)
+
+    if merge:
+        rdd = datardd.flatMap(nc_partition).reduceByKey(lambda a, b: a.merge(b, inplace=True))
+    else:
+        rdd = datardd.flatMap(nc_partition)
+    if not partitions:
+        return rdd
+
+    return rdd.repartition(partitions)
